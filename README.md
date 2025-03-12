@@ -1,9 +1,11 @@
 # imgoingcrazy
 
 import gi
-import ctypes
 import numpy as np
 import pyds
+import cv2
+import ctypes
+import os
 from gi.repository import Gst, GObject
 
 gi.require_version("Gst", "1.0")
@@ -20,6 +22,8 @@ class CustomPreprocess(Gst.Element):
         self.sinkpad.set_chain_function(self.chainfunc)
         self.add_pad(self.srcpad)
         self.add_pad(self.sinkpad)
+        os.makedirs("preprocess_input", exist_ok=True)
+        os.makedirs("preprocess_output", exist_ok=True)
 
     def chainfunc(self, pad, parent, buffer):
         batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(buffer))
@@ -27,36 +31,38 @@ class CustomPreprocess(Gst.Element):
 
         while l_frame is not None:
             frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+            frame_number = frame_meta.frame_num
             l_obj = frame_meta.obj_meta_list
+
+            # Retrieve the original frame
+            n_frame = pyds.get_nvds_buf_surface(hash(buffer), frame_meta.batch_id)
+            frame_copy = np.array(n_frame, copy=True, order='C')
 
             while l_obj is not None:
                 obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
 
-                if obj_meta.unique_component_id == 1 and obj_meta.class_id == 0:
-                    l_obj_user_meta = obj_meta.obj_user_meta_list
-                    while l_obj_user_meta is not None:
-                        try:
-                            user_meta = pyds.NvDsUserMeta.cast(l_obj_user_meta.data)
-                        except StopIteration:
-                            break
+                # Extract bounding box
+                x, y, w, h = (
+                    int(obj_meta.rect_params.left),
+                    int(obj_meta.rect_params.top),
+                    int(obj_meta.rect_params.width),
+                    int(obj_meta.rect_params.height)
+                )
 
-                        if user_meta.base_meta.meta_type == pyds.NvDsMetaType.NVDSINFER_TENSOR_OUTPUT_META:
-                            tensor_meta = pyds.NvDsInferTensorMeta.cast(user_meta.user_meta_data)
-                            layer = pyds.get_nvds_LayerInfo(tensor_meta, 0)
-                            ptr = ctypes.cast(pyds.get_ptr(layer.buffer), ctypes.POINTER(ctypes.c_float))
-                            np_array = np.ctypeslib.as_array(ptr, shape=(3, 640, 640)).astype(np.float32)
+                # Crop the detected object
+                cropped_image = frame_copy[y:y + h, x:x + w]
 
-                            # Custom Preprocessing: Normalize input tensor
-                            np_array = (np_array - np.mean(np_array)) / (np.std(np_array) + 1e-6)
-                            np_array = np.clip(np_array, -1, 1)
+                # Save input image
+                input_filename = f"preprocess_input/frame_{frame_number}_obj_{obj_meta.object_id}.jpg"
+                cv2.imwrite(input_filename, cropped_image)
 
-                            # Copy back processed data
-                            np.copyto(ptr, np_array.astype(np.float32))
-                        
-                        try:
-                            l_obj_user_meta = l_obj_user_meta.next
-                        except StopIteration:
-                            break
+                # Preprocess (e.g., resizing to match SGIE input shape)
+                processed_image = cv2.resize(cropped_image, (128, 384))
+                processed_image = processed_image.astype(np.float32) / 255.0  # Normalize to [0,1]
+
+                # Save output image
+                output_filename = f"preprocess_output/frame_{frame_number}_obj_{obj_meta.object_id}.jpg"
+                cv2.imwrite(output_filename, (processed_image * 255).astype(np.uint8))
 
                 try:
                     l_obj = l_obj.next
