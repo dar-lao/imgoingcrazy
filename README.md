@@ -201,3 +201,17 @@ Gst.Element.set_static_metadata(
     "A custom element for preprocessing frames before secondary inference",
     "Your Name <your.email@example.com>"
 )
+
+
+
+    class MyCustomElement(GstBase.BaseTransform):
+        __gstmetadata__ = ("MyCustomElement",      # Name
+                           "Transform",            # Category
+                           "My Custom Element",    # Description
+                           "Your Name <your.email@example.com>") # Author
+
+        def __init__(self):
+            GstBase.BaseTransform.__init__(self)
+
+
+
