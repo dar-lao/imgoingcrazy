@@ -190,4 +190,6 @@ class DeepStreamPipeline:
 
 if __name__ == "__main__":
     pipe = DeepStreamPipeline()
+Gst.Element.register(None, "custompreprocess", Gst.Rank.NONE, CustomPreprocess)
+
 
