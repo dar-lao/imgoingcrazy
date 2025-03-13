@@ -193,3 +193,11 @@ if __name__ == "__main__":
 Gst.Element.register(None, "custompreprocess", Gst.Rank.NONE, CustomPreprocess)
 
 
+# Set valid metadata for the custom element.
+Gst.Element.set_static_metadata(
+    CustomPreprocess,
+    "Custom Preprocess Element",
+    "Preprocessing",
+    "A custom element for preprocessing frames before secondary inference",
+    "Your Name <your.email@example.com>"
+)
