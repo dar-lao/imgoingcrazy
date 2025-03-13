@@ -224,3 +224,31 @@ pgie_human_detection.link(custom_preprocess)
 # Alternatively, if conversion is needed between elements:
 pgie_human_detection.link(converter)
 converter.link(custom_preprocess)
+
+
+
+# Number of images to display
+num_files = len(npy_files)
+
+# Set up subplot grid
+cols = 4  # Number of columns in the grid
+rows = (num_files + cols - 1) // cols  # Calculate the required rows
+
+fig, axes = plt.subplots(rows, cols, figsize=(12, 3 * rows))
+
+# Flatten axes array if necessary
+axes = axes.flatten()
+
+# Loop through files and display them
+for i, file in enumerate(npy_files):
+    data = np.load(os.path.join(directory, file))  # Load .npy file
+    axes[i].imshow(data, cmap='gray')  # Display the image (adjust colormap as needed)
+    axes[i].set_title(file)
+    axes[i].axis("off")
+
+# Hide any unused subplots
+for j in range(i + 1, len(axes)):
+    axes[j].axis("off")
+
+plt.tight_layout()
+plt.show()
