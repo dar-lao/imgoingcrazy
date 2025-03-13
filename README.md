@@ -214,4 +214,13 @@ Gst.Element.set_static_metadata(
             GstBase.BaseTransform.__init__(self)
 
 
+converter = create_element("nvvideoconvert", "video-converter")
+# Depending on your setup, you might need to set properties on the converter to force RGBA/RGB.
+self.pipeline.add(converter)
 
+# Link the elements appropriately:
+streammux.link(pgie_human_detection)
+pgie_human_detection.link(custom_preprocess)
+# Alternatively, if conversion is needed between elements:
+pgie_human_detection.link(converter)
+converter.link(custom_preprocess)
