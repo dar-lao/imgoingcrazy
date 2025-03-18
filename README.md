@@ -251,4 +251,232 @@ for j in range(i + 1, len(axes)):
     axes[j].axis("off")
 
 plt.tight_layout()
-plt.show()
+plt.show()]
+
+
+
+
+
+
+
+import redis
+import time
+
+# Base manager class: holds the redis connection, thresholds, and current state.
+class GlobalTrackStatusManager:
+    """
+    Base Global Track Status Manager.
+    
+    Maintains common functions for updating Redis and holds the current state.
+    All state-specific logics are implemented in child classes (TentativeState, ActiveState,
+    InactiveState, TerminatedState). The update() method delegates processing to the current state.
+    """
+    def __init__(self, global_id: str, redis_client: redis.Redis,
+                 tentative_threshold: float, inactive_threshold: float):
+        self.global_id = global_id
+        self.redis = redis_client
+        self.tentative_threshold = tentative_threshold  # seconds
+        self.inactive_threshold = inactive_threshold      # seconds
+        # Initialize state as tentative
+        self.state = TentativeState(self)
+        self.state.on_enter()
+
+    # --- Redis update helper functions ---
+    def update_state_in_redis(self, state: str):
+        key = f"global:{self.global_id}"
+        self.redis.hset(key, "state", state)
+
+    def add_to_set(self, set_name: str):
+        self.redis.sadd(set_name, self.global_id)
+
+    def remove_from_set(self, set_name: str):
+        self.redis.srem(set_name, self.global_id)
+
+    def add_active_local_track(self, track_id: str):
+        key = f"global_is:active_local_track_id_set:{self.global_id}"
+        self.redis.sadd(key, track_id)
+
+    def remove_active_local_track(self, track_id: str):
+        key = f"global_is:active_local_track_id_set:{self.global_id}"
+        self.redis.srem(key, track_id)
+
+    def get_active_local_track_count(self) -> int:
+        key = f"global_is:active_local_track_id_set:{self.global_id}"
+        return self.redis.scard(key)
+
+    def set_last_detection_time(self, ntp_time: float):
+        key = f"global:{self.global_id}"
+        self.redis.hset(key, "last_detection_time", ntp_time)
+
+    def get_last_detection_time(self) -> float:
+        key = f"global:{self.global_id}"
+        value = self.redis.hget(key, "last_detection_time")
+        if value is not None:
+            return float(value.decode("utf-8"))
+        return None
+
+    # --- Update handling ---
+    def update(self, message: dict):
+        """
+        Receives an update message and delegates processing to the current state.
+        """
+        self.state.update(message)
+
+    def transition_to(self, new_state_class):
+        """
+        Transition to a new state and run its on_enter actions.
+        """
+        self.state = new_state_class(self)
+        self.state.on_enter()
+
+
+# Base state class: all state implementations inherit from this.
+class GlobalTrackState:
+    def __init__(self, manager: GlobalTrackStatusManager):
+        self.manager = manager
+
+    def update(self, message: dict):
+        raise NotImplementedError("State update() must be implemented by subclasses.")
+
+    def on_enter(self):
+        # Optional hook for entering a state.
+        pass
+
+
+# ----- State Implementations -----
+
+class TentativeState(GlobalTrackState):
+    """
+    When a global track is first created it is in tentative state.
+    Depending on the detection time provided in the message, the track either transitions
+    to active (if detection_time > tentative_threshold) or to terminated.
+    """
+    def update(self, message: dict):
+        # Expecting a detection_time value to decide on state transition.
+        detection_time = message.get("detection_time", 0)
+        if detection_time > self.manager.tentative_threshold:
+            # Transition to Active state.
+            self.manager.update_state_in_redis("active")
+            self.manager.remove_from_set("tentative_global_ids")
+            self.manager.add_to_set("active_global_ids")
+            self.manager.transition_to(ActiveState)
+        else:
+            # Not enough detection; terminate.
+            self.manager.update_state_in_redis("terminated")
+            self.manager.remove_from_set("tentative_global_ids")
+            self.manager.add_to_set("terminated_global_ids")
+            self.manager.transition_to(TerminatedState)
+
+    def on_enter(self):
+        print(f"[TentativeState] Global track {self.manager.global_id} entered Tentative state.")
+        self.manager.update_state_in_redis("tentative")
+        self.manager.add_to_set("tentative_global_ids")
+
+
+class ActiveState(GlobalTrackState):
+    """
+    Active state: track is actively associated with one or more local tracks.
+    Processes removal events, updates last detection times, and checks inactivity.
+    """
+    def update(self, message: dict):
+        event_type = message.get("event_type")
+        # For removal events from local tracks:
+        if event_type == "remove":
+            track_id = message.get("track_id")
+            if track_id:
+                self.manager.remove_active_local_track(track_id)
+                print(f"[ActiveState] Removed local track {track_id} from global {self.manager.global_id}.")
+                # Transition to inactive if no local tracks remain.
+                if self.manager.get_active_local_track_count() == 0:
+                    self.manager.update_state_in_redis("inactive")
+                    self.manager.remove_from_set("active_global_ids")
+                    self.manager.add_to_set("inactive_global_ids")
+                    self.manager.transition_to(InactiveState)
+        # Check inactive threshold: if too much time has passed, terminate the track.
+        current_time = time.time()
+        last_detection = self.manager.get_last_detection_time()
+        if last_detection is not None and (current_time - last_detection > self.manager.inactive_threshold):
+            self.manager.update_state_in_redis("terminated")
+            self.manager.remove_from_set("active_global_ids")
+            self.manager.add_to_set("terminated_global_ids")
+            self.manager.transition_to(TerminatedState)
+        # Update the last detection time if provided.
+        if "ntp_time" in message:
+            self.manager.set_last_detection_time(message["ntp_time"])
+
+    def on_enter(self):
+        print(f"[ActiveState] Global track {self.manager.global_id} entered Active state.")
+        self.manager.update_state_in_redis("active")
+        self.manager.remove_from_set("tentative_global_ids")
+        self.manager.add_to_set("active_global_ids")
+
+
+class InactiveState(GlobalTrackState):
+    """
+    Inactive state: No active local tracks are currently associated.
+    A rematch event can transition the state back to active.
+    """
+    def update(self, message: dict):
+        event_type = message.get("event_type")
+        # When a rematch occurs, return to active state.
+        if event_type == "match":
+            self.manager.update_state_in_redis("active")
+            self.manager.remove_from_set("inactive_global_ids")
+            self.manager.add_to_set("active_global_ids")
+            self.manager.transition_to(ActiveState)
+
+    def on_enter(self):
+        print(f"[InactiveState] Global track {self.manager.global_id} entered Inactive state.")
+        self.manager.update_state_in_redis("inactive")
+        self.manager.remove_from_set("active_global_ids")
+        self.manager.add_to_set("inactive_global_ids")
+
+
+class TerminatedState(GlobalTrackState):
+    """
+    Terminated state: no further updates are processed.
+    """
+    def update(self, message: dict):
+        print(f"[TerminatedState] Global track {self.manager.global_id} is terminated; update ignored.")
+
+    def on_enter(self):
+        print(f"[TerminatedState] Global track {self.manager.global_id} entered Terminated state.")
+        self.manager.update_state_in_redis("terminated")
+        # Clean up: remove from other state sets and add to terminated set.
+        self.manager.remove_from_set("active_global_ids")
+        self.manager.remove_from_set("tentative_global_ids")
+        self.manager.remove_from_set("inactive_global_ids")
+        self.manager.add_to_set("terminated_global_ids")
+
+
+# ----- Example Usage -----
+if __name__ == "__main__":
+    # Connect to Redis (adjust host/port as needed)
+    redis_client = redis.Redis(host='localhost', port=6379, db=0)
+    
+    # Create a manager for a specific global track.
+    global_id = "global_1234"
+    tentative_threshold = 5.0    # seconds: detection_time > 5 means active
+    inactive_threshold = 10.0    # seconds: inactive too long triggers termination
+
+    manager = GlobalTrackStatusManager(global_id, redis_client, tentative_threshold, inactive_threshold)
+    
+    # Example: Process a tentative update with detection_time.
+    # For instance, a message that comes with detection_time = 6 should trigger a transition to ActiveState.
+    message_detection = {"detection_time": 6.0, "ntp_time": time.time()}
+    manager.update(message_detection)
+    
+    # Simulate an active state removal event:
+    # Here we assume a local track removal event provides "remove" and the track_id.
+    message_remove = {"event_type": "remove", "track_id": "27-1", "ntp_time": time.time()}
+    manager.update(message_remove)
+    
+    # Simulate a rematch event while in Inactive state:
+    message_rematch = {"event_type": "match"}
+    manager.update(message_rematch)
+    
+    # Simulate inactivity causing termination:
+    # Provide an ntp_time value in the past to trigger the inactivity threshold.
+    message_inactive = {"ntp_time": time.time() - 20}  # 20 seconds ago
+    manager.update(message_inactive)
+
