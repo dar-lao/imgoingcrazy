@@ -1320,3 +1320,47 @@ if __name__ == "__main__":
     
     # When done (e.g., on application shutdown), shut down the scheduler:
     # manager.shutdown_scheduler()
+
+
+
+    class GlobalTrackRegistry:
+    """
+    Manages multiple GlobalTrackStatusManager instances, one per global ID.
+    When a new event arrives, if the global ID doesn't exist in the registry,
+    a new GlobalTrackStatusManager is created.
+    """
+    def __init__(self, redis_client, tentative_threshold, inactive_threshold):
+        self.managers = {}  # key: global_id, value: GlobalTrackStatusManager instance
+        self.redis_client = redis_client
+        self.tentative_threshold = tentative_threshold
+        self.inactive_threshold = inactive_threshold
+
+    def handle_event(self, event: dict):
+        # Assume the event contains a global_id field.
+        global_id = event.get("global_id")
+        if not global_id:
+            print("Event does not contain a global_id, ignoring event.")
+            return
+
+        if global_id not in self.managers:
+            # Create a new manager for this global ID.
+            print(f"Creating a new GlobalTrackStatusManager for global ID: {global_id}")
+            from global_track_status_manager import GlobalTrackStatusManager
+            manager = GlobalTrackStatusManager(
+                global_id,
+                self.redis_client,
+                self.tentative_threshold,
+                self.inactive_threshold
+            )
+            self.managers[global_id] = manager
+
+        # Dispatch the event to the corresponding manager.
+        self.managers[global_id].update(event)
+
+    def remove_manager(self, global_id: str):
+        """
+        Optionally remove a manager if it is terminated or no longer needed.
+        """
+        if global_id in self.managers:
+            del self.managers[global_id]
+
