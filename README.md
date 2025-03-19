@@ -727,3 +727,298 @@ if __name__ == "__main__":
     message_inactive = {"ntp_time": time.time() - 20}  # 20 seconds ago
     manager.update(message_inactive)
 
+
+
+
+
+
+
+import time
+from cachetools import TTLCache
+from global_track_state_enum import GlobalTrackStateType
+from redis_client import RedisClient  # Uses our redis client abstraction
+
+# Base manager class: holds the redis client instance, thresholds, TTL caches, and current state.
+class GlobalTrackStatusManager:
+    """
+    Base Global Track Status Manager.
+
+    Maintains common functions for updating the data store and holds the current state.
+    All state-specific logic is implemented in child classes (TentativeState, ActiveState,
+    InactiveState, TerminatedState). The update() method delegates processing to the current state.
+    """
+    def __init__(self, global_id: str, redis_client: RedisClient,
+                 tentative_threshold: float, inactive_threshold: float):
+        self.global_id = global_id
+        self.redis = redis_client  # An instance of RedisClient
+
+        self.tentative_threshold = tentative_threshold  # seconds for tentative TTL
+        self.inactive_threshold = inactive_threshold      # seconds for inactive TTL
+
+        # TTLCache for tentative and inactive states. The caches store a marker value (e.g., True).
+        # If the key expires, it means the time-based event should trigger.
+        self.tentative_cache = TTLCache(maxsize=1000, ttl=self.tentative_threshold)
+        self.inactive_cache = TTLCache(maxsize=1000, ttl=self.inactive_threshold)
+
+        # Initialize state as Tentative.
+        self.state = TentativeState(self)
+        self.state.on_enter()
+
+    # --- Data store update helper functions (using redis_client methods) ---
+    def update_state_in_store(self, state: str):
+        key = f"global:{self.global_id}"
+        self.redis.set_global_id(key, "state", state)
+
+    def add_to_set(self, set_name: str):
+        self.redis.add_to_set(set_name, self.global_id)
+
+    def remove_from_set(self, set_name: str):
+        self.redis.remove_from_set(set_name, self.global_id)
+
+    def add_active_local_track(self, track_id: str):
+        key = f"global_is:active_local_track_id_set:{self.global_id}"
+        self.redis.add_to_set(key, track_id)
+
+    def remove_active_local_track(self, track_id: str):
+        key = f"global_is:active_local_track_id_set:{self.global_id}"
+        self.redis.remove_from_set(key, track_id)
+
+    def get_active_local_track_count(self) -> int:
+        key = f"global_is:active_local_track_id_set:{self.global_id}"
+        return self.redis.get_set_cardinality(key)
+
+    def set_last_detection_time(self, ntp_time: float):
+        key = f"global:{self.global_id}"
+        self.redis.set_global_id(key, "last_detection_time", ntp_time)
+
+    def get_last_detection_time(self) -> float:
+        key = f"global:{self.global_id}"
+        value = self.redis.get_global_id(key, "last_detection_time")
+        if value is not None:
+            return float(value)
+        return None
+
+    # --- TTL Event Processing ---
+    def process_ttl_events(self):
+        """
+        Checks if the TTL-based events (from the TTL caches) have expired.
+        If in TentativeState and the tentative_cache entry is gone, it indicates a timeout.
+        Likewise for InactiveState.
+        """
+        # Check for tentative state expiration.
+        if isinstance(self.state, TentativeState):
+            if self.global_id not in self.tentative_cache:
+                print(f"[TTL] Tentative TTL expired for global track {self.global_id}. Transitioning to terminated state.")
+                self.remove_from_set("tentative_global_ids")
+                self.add_to_set("terminated_global_ids")
+                self.transition_to(TerminatedState)
+                return
+
+        # Check for inactive state expiration.
+        if isinstance(self.state, InactiveState):
+            if self.global_id not in self.inactive_cache:
+                print(f"[TTL] Inactive TTL expired for global track {self.global_id}. Transitioning to terminated state.")
+                self.remove_from_set("inactive_global_ids")
+                self.add_to_set("terminated_global_ids")
+                self.transition_to(TerminatedState)
+                return
+
+    # --- Update handling ---
+    def update(self, message: dict):
+        """
+        Receives an update message, processes any TTL events first, then delegates processing to the current state.
+        """
+        self.process_ttl_events()
+        self.state.update(message)
+
+    def transition_to(self, new_state_class):
+        """
+        Transition to a new state and run its on_enter actions.
+        """
+        self.state = new_state_class(self)
+        self.state.on_enter()
+
+
+# Base state class: all state implementations inherit from this.
+class GlobalTrackState:
+    def __init__(self, manager: GlobalTrackStatusManager):
+        self.manager = manager
+        # Child classes must set state_type using GlobalTrackStateType Enum.
+        self.state_type: GlobalTrackStateType = None
+
+    def update(self, message: dict):
+        raise NotImplementedError("State update() must be implemented by subclasses.")
+
+    def on_enter(self):
+        # Update the data store with the current state's value.
+        self.manager.update_state_in_store(self.state_type.value)
+        print(f"[{self.state_type.value.capitalize()}State] Global track {self.manager.global_id} entered {self.state_type.value.capitalize()} state.")
+
+
+# ----- State Implementations -----
+
+class TentativeState(GlobalTrackState):
+    """
+    Tentative state: When a global track is first created, it enters tentative state.
+    A TTL is added to the tentative_cache. If a detection event (with sufficient detection_time)
+    occurs before TTL expires, the track transitions to ActiveState; otherwise, TTL expiration
+    triggers a transition to TerminatedState.
+    """
+    def __init__(self, manager):
+        super().__init__(manager)
+        self.state_type = GlobalTrackStateType.TENTATIVE
+
+    def update(self, message: dict):
+        # Process a detection event.
+        detection_time = message.get("detection_time", 0)
+        # If detection event comes in before TTL expires:
+        if detection_time > self.manager.tentative_threshold:
+            # Cancel the TTL by removing from tentative_cache.
+            if self.manager.global_id in self.manager.tentative_cache:
+                del self.manager.tentative_cache[self.manager.global_id]
+            self.manager.remove_from_set("tentative_global_ids")
+            self.manager.add_to_set("active_global_ids")
+            self.manager.transition_to(ActiveState)
+        else:
+            # If detection_time insufficient, we can choose to transition immediately.
+            if self.manager.global_id in self.manager.tentative_cache:
+                del self.manager.tentative_cache[self.manager.global_id]
+            self.manager.remove_from_set("tentative_global_ids")
+            self.manager.add_to_set("terminated_global_ids")
+            self.manager.transition_to(TerminatedState)
+
+    def on_enter(self):
+        super().on_enter()
+        # Insert an entry into the tentative_cache. Its TTL is tentative_threshold seconds.
+        self.manager.tentative_cache[self.manager.global_id] = True
+        self.manager.add_to_set("tentative_global_ids")
+
+
+class ActiveState(GlobalTrackState):
+    """
+    Active state: Track is actively associated with one or more local tracks.
+    Handles add/remove events and updates the last detection time.
+    Note: TTL-based events are not used in ActiveState; instead, inactivity is checked via timestamps.
+    """
+    def __init__(self, manager):
+        super().__init__(manager)
+        self.state_type = GlobalTrackStateType.ACTIVE
+
+    def update(self, message: dict):
+        event_type = message.get("event_type")
+        if event_type == "remove":
+            track_id = message.get("track_id")
+            if track_id:
+                self.manager.remove_active_local_track(track_id)
+                print(f"[ActiveState] Removed local track {track_id} from global {self.manager.global_id}.")
+                if self.manager.get_active_local_track_count() == 0:
+                    self.manager.remove_from_set("active_global_ids")
+                    self.manager.add_to_set("inactive_global_ids")
+                    # When transitioning to inactive state, add a TTL entry.
+                    self.manager.transition_to(InactiveState)
+                    return
+        elif event_type == "add":
+            track_id = message.get("track_id")
+            if track_id:
+                self.manager.add_active_local_track(track_id)
+                print(f"[ActiveState] Added local track {track_id} to global {self.manager.global_id}.")
+        # Update the last detection time if provided.
+        if "ntp_time" in message:
+            self.manager.set_last_detection_time(message["ntp_time"])
+
+        # In addition, check inactivity via timestamps.
+        current_time = time.time()
+        last_detection = self.manager.get_last_detection_time()
+        if last_detection is not None and (current_time - last_detection > self.manager.inactive_threshold):
+            self.manager.remove_from_set("active_global_ids")
+            self.manager.add_to_set("terminated_global_ids")
+            self.manager.transition_to(TerminatedState)
+            return
+
+    def on_enter(self):
+        super().on_enter()
+        self.manager.remove_from_set("tentative_global_ids")
+        self.manager.add_to_set("active_global_ids")
+
+
+class InactiveState(GlobalTrackState):
+    """
+    Inactive state: No active local tracks are associated.
+    A TTL is added to the inactive_cache. If no rematch event occurs before TTL expires,
+    the state automatically transitions to TerminatedState.
+    """
+    def __init__(self, manager):
+        super().__init__(manager)
+        self.state_type = GlobalTrackStateType.INACTIVE
+
+    def update(self, message: dict):
+        event_type = message.get("event_type")
+        # Rematch event triggers transition back to ActiveState.
+        if event_type == "match":
+            # Cancel the TTL by removing from inactive_cache.
+            if self.manager.global_id in self.manager.inactive_cache:
+                del self.manager.inactive_cache[self.manager.global_id]
+            self.manager.remove_from_set("inactive_global_ids")
+            self.manager.add_to_set("active_global_ids")
+            self.manager.transition_to(ActiveState)
+
+    def on_enter(self):
+        super().on_enter()
+        self.manager.remove_from_set("active_global_ids")
+        self.manager.add_to_set("inactive_global_ids")
+        # Insert an entry into the inactive_cache. Its TTL is inactive_threshold seconds.
+        self.manager.inactive_cache[self.manager.global_id] = True
+
+
+class TerminatedState(GlobalTrackState):
+    """
+    Terminated state: No further updates are processed.
+    """
+    def __init__(self, manager):
+        super().__init__(manager)
+        self.state_type = GlobalTrackStateType.TERMINATED
+
+    def update(self, message: dict):
+        print(f"[TerminatedState] Global track {self.manager.global_id} is terminated; update ignored.")
+
+    def on_enter(self):
+        super().on_enter()
+        self.manager.remove_from_set("active_global_ids")
+        self.manager.remove_from_set("tentative_global_ids")
+        self.manager.remove_from_set("inactive_global_ids")
+        self.manager.add_to_set("terminated_global_ids")
+        # Clean up from TTL caches if present.
+        self.manager.tentative_cache.pop(self.manager.global_id, None)
+        self.manager.inactive_cache.pop(self.manager.global_id, None)
+
+
+# ----- Example Usage -----
+if __name__ == "__main__":
+    # Create an instance of RedisClient (from redis_client.py)
+    redis_client = RedisClient()  # Assumes its __init__ handles connection details.
+    
+    # Create a manager for a specific global track.
+    global_id = "global_1234"
+    tentative_threshold = 5.0    # seconds: TTL for tentative state
+    inactive_threshold = 10.0    # seconds: TTL for inactive state
+
+    manager = GlobalTrackStatusManager(global_id, redis_client, tentative_threshold, inactive_threshold)
+    
+    # Example: Process a tentative update with detection_time.
+    # A message with detection_time = 6 should trigger a transition to ActiveState (if received before TTL expires).
+    message_detection = {"detection_time": 6.0, "ntp_time": time.time()}
+    manager.update(message_detection)
+    
+    # Simulate an active state event: add a local track.
+    message_add = {"event_type": "add", "track_id": "27-1", "ntp_time": time.time()}
+    manager.update(message_add)
+    
+    # Simulate an active state removal event.
+    message_remove = {"event_type": "remove", "track_id": "27-1", "ntp_time": time.time()}
+    manager.update(message_remove)
+    
+    # When no local tracks remain, the state transitions to InactiveState.
+    # Then, if no rematch occurs before the TTL expires in the inactive_cache,
+    # process_ttl_events (called on the next update) will transition the state to TerminatedState.
+    time.sleep(inactive_threshold + 1)  # wait for TTL to expire
+    manager.update({})  # a call to update() will trigger process_ttl_events() and cause the termination
