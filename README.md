@@ -1364,3 +1364,136 @@ if __name__ == "__main__":
         if global_id in self.managers:
             del self.managers[global_id]
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import time
+from redis_client import RedisClient
+from global_track_status_manager import GlobalTrackStatusManager
+from global_track_state_enum import GlobalTrackStateType
+
+# A simple registry to manage multiple global track managers.
+class GlobalTrackRegistry:
+    def __init__(self, redis_client, tentative_threshold, inactive_threshold):
+        self.managers = {}  # key: global_id, value: GlobalTrackStatusManager instance
+        self.redis_client = redis_client
+        self.tentative_threshold = tentative_threshold
+        self.inactive_threshold = inactive_threshold
+
+    def handle_event(self, event: dict):
+        """
+        If the event contains a 'global_id', use or create a manager for it.
+        Otherwise, ignore or route appropriately.
+        """
+        global_id = event.get("global_id")
+        if not global_id:
+            print("Local event received without a global_id; skipping.")
+            return
+
+        if global_id not in self.managers:
+            print(f"Creating GlobalTrackStatusManager for global_id: {global_id}")
+            manager = GlobalTrackStatusManager(
+                global_id,
+                self.redis_client,
+                self.tentative_threshold,
+                self.inactive_threshold
+            )
+            self.managers[global_id] = manager
+
+        print(f"Dispatching event to {global_id}: {event}")
+        self.managers[global_id].update(event)
+
+    def shutdown_all(self):
+        for manager in self.managers.values():
+            manager.shutdown_scheduler()
+
+if __name__ == "__main__":
+    # Create an instance of RedisClient (your implementation in redis_client.py)
+    redis_client = RedisClient()
+
+    # Set low thresholds (in seconds) for testing.
+    tentative_threshold = 3.0   # seconds for tentative TTL
+    inactive_threshold = 3.0    # seconds for inactive TTL
+
+    # Create a registry instance.
+    registry = GlobalTrackRegistry(redis_client, tentative_threshold, inactive_threshold)
+
+    # Define a complete pipeline (queue) of test messages:
+    messages = [
+        # 1. New global track "global_new_1": creation (tentative by default) via an add event.
+        {"global_id": "global_new_1", "event_type": "add", "track_id": "new_1", "ntp_time": time.time(), "detection_time": 0.5},
+
+        # 2. A detection event for "global_new_1" (detection_time > tentative_threshold) to force transition to active.
+        {"global_id": "global_new_1", "detection_time": 4.0, "ntp_time": time.time()},
+
+        # 3. In active state, add another local track.
+        {"global_id": "global_new_1", "event_type": "add", "track_id": "new_2", "ntp_time": time.time()},
+
+        # 4. Remove one track (still active since another remains).
+        {"global_id": "global_new_1", "event_type": "remove", "track_id": "new_1", "ntp_time": time.time()},
+
+        # 5. Remove the last active track to trigger transition to inactive.
+        {"global_id": "global_new_1", "event_type": "remove", "track_id": "new_2", "ntp_time": time.time()},
+
+        # 6. (No message here) Wait for inactive TTL to expire to trigger automatic transition to terminated.
+
+        # 7. New global track "global_match_1": creation as tentative.
+        {"global_id": "global_match_1", "event_type": "add", "track_id": "match_1", "ntp_time": time.time()},
+
+        # 8. A match event for "global_match_1" that indicates merging with an existing global track.
+        {"global_id": "global_match_1", "event_type": "match"},
+
+        # 9. A split/assoc event from global for an existing global track.
+        {"global_id": "afjaoieur-arjeoarj-uouh-4314n",
+         "event": {"track_id": "27-1", "event_type": "remove"}},
+
+        # 10. A local track terminated event (TimeSeriesEvent) from a camera.
+        {"global_id": "global_local_1",
+         "event_type": "track",
+         "cam_id": "27",
+         "ntp_time": 200,
+         "events": [
+             {"event_type": "remove", "track id": "27-1", "class_id": 1},
+             {"event_type": "remove", "track_id": "27-2", "class_id": 1}
+         ]}
+    ]
+
+    # Process each message with a brief pause between them.
+    for msg in messages:
+        print("\n--- Processing message ---")
+        print(msg)
+        registry.handle_event(msg)
+        time.sleep(1)
+
+    # Wait for TTL-based transitions (inactive and tentative TTL expirations).
+    print("\nWaiting for TTL-based transitions...")
+    time.sleep(tentative_threshold + inactive_threshold + 1)
+
+    # Print final state for each managed global ID.
+    print("\nFinal global track states:")
+    for global_id, manager in registry.managers.items():
+        state = redis_client.get_global_id(f"global:{global_id}", "state")
+        print(f"Global ID: {global_id}, final state: {state}")
+
+    # Shut down the scheduler for all managers.
+    registry.shutdown_all()
+
