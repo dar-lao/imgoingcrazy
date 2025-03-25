@@ -1497,3 +1497,39 @@ if __name__ == "__main__":
     # Shut down the scheduler for all managers.
     registry.shutdown_all()
 
+
+
+
+
+
+    class ExpCache(TTLCache):
+    def __init__(self, callback, maxsize, ttl):
+        super().__init__(maxsize, ttl)
+        self.callback = callback
+
+    def expire(self, time=None):
+        expired_items = super().expire(time)
+        if expired_items:
+            self.callback(expired_items)
+        return expired_items
+
+    def __getitem__(self, key):
+        self.expire()
+        return super().__getitem__(key)
+
+    def __setitem__(self, key, value):
+        self.expire()
+        return super().__setitem__(key, value)
+
+    def __contains__(self, key):
+        self.expire()
+        return super().__contains__(key)
+
+    def get(self, key, default=None):
+        self.expire()
+        return super().get(key, default)
+
+    def pop(self, key, default=None):
+        self.expire()
+        return super().pop(key, default)
+
