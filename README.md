@@ -1533,3 +1533,163 @@ if __name__ == "__main__":
         self.expire()
         return super().pop(key, default)
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+1. Overview
+ISee Global Status Manager is a microservice component designed to manage the lifecycle and status of global tracking IDs derived from local tracking events. It implements a state machine with states such as Tentative, Active, Inactive, and Terminated. The component processes events asynchronously via a unified event queue and uses time-based triggers (implemented via threading.Timer) to automatically handle state transitions.
+
+2. Architecture
+2.1. State Machine
+States & Transitions:
+The system models each global track as a state machine:
+
+Tentative: A new global track is initially tentative. If a match event occurs (indicating a merge), the tentative global ID is terminated. Otherwise, a detection event or timeout (using a timer) can transition the track to Active.
+
+Active: When a global track has enough local track associations or detection evidence, it transitions to Active. In Active, events such as local track additions and removals update its status. Prolonged inactivity can trigger a transition to Inactive or Terminated.
+
+Inactive: If no local tracks are active, the global track goes inactive. A rematch event can transition it back to Active. Otherwise, a timer will eventually trigger termination.
+
+Terminated: The final state, where no further events are processed.
+
+2.2. Event Processing
+Unified Event Queue:
+Each GlobalTrackStatusManager instance maintains its own thread-safe event queue. An internal worker thread continuously processes incoming events, delegating them to the current state's update() method.
+
+Threading & Concurrency:
+The project uses Python's threading module to run the event processor and to schedule time-based state transitions. A lock is used to ensure thread safety when updating shared state and canceling/rescheduling timers.
+
+2.3. Timers for Time-Based Transitions
+Replacement for APScheduler/TTLCache:
+Instead of using external scheduling or caching libraries, the project employs threading.Timer to trigger time-based transitions:
+
+When entering the Tentative or Inactive states, a timer is scheduled.
+
+If no relevant event occurs before the timer expires, the timer callback (protected by a lock) automatically transitions the state (e.g., from Tentative to Active, or from Inactive to Terminated).
+
+3. Components
+3.1. GlobalTrackStatusManager
+Responsibilities:
+
+Maintain the current global track state.
+
+Process events through a unified event processor (using an internal event queue).
+
+Manage time-based transitions using a threading.Timer.
+
+Delegate state-specific logic to state classes.
+
+Interact with the underlying data store via a Redis client abstraction.
+
+3.2. GlobalTrackState (Base Class) and Derived States
+GlobalTrackState:
+The base class that defines the interface (update() and on_enter()) for state-specific behavior.
+
+Derived States:
+
+TentativeState: Handles the initial state, scheduling a timer and transitioning on match or detection events.
+
+ActiveState: Manages active associations, handling add/remove events and checking for inactivity.
+
+InactiveState: Waits for a rematch event or timeout to trigger termination.
+
+TerminatedState: Final state that ignores any further events.
+
+3.3. RedisClient (or DummyRedisClient)
+Role:
+Provides an abstraction for data-store operations (e.g., setting and getting global track attributes, maintaining sets of active tracks).
+
+Usage:
+The manager calls methods like set_global_id(), add_to_set(), and get_set_cardinality() to persist state changes.
+
+3.4. GlobalTrackRegistry
+Purpose:
+A helper component to manage multiple GlobalTrackStatusManager instances, routing events to the appropriate manager based on global ID.
+
+4. Usage
+4.1. Initialization
+Instantiate a Redis client (or use a dummy implementation for testing).
+
+Create a GlobalTrackRegistry with desired thresholds.
+
+Dispatch events (from a queue, message bus, etc.) to the registry; the registry creates or reuses a GlobalTrackStatusManager for each global ID.
+
+4.2. Event Dispatching
+Events are enqueued to the respective GlobalTrackStatusManager.
+
+The unified event processor picks up events and calls the appropriate state’s update method.
+
+Time-based transitions are automatically handled by timers set up in the state’s on_enter() methods.
+
+4.3. Shutting Down
+Call the manager’s shutdown method to stop the event processor thread and cancel any active timers.
+
+5. Testing & Example Pipeline
+Unit Tests:
+The project includes unit tests that simulate various scenarios: local track removal, match events, detection events, and timeouts.
+
+Test Harness:
+A script that queues a sequence of events through the registry, showing the transitions from Tentative to Active, Inactive, and Terminated.
+
+6. Design Decisions
+Asynchronous Event Processing:
+Using a unified event queue decouples the arrival of events from their processing, ensuring ordered and thread-safe state transitions.
+
+Time-Based Transitions:
+Replacing external schedulers with threading.Timer provides a lightweight and self-contained method for handling state timeouts.
+
+Modular State Machine:
+The state machine design encapsulates state-specific logic in separate classes, improving maintainability and testability.
+
+7. Dependencies
+Python 3.10+ (or later)
+
+Standard library modules: threading, queue, time, enum
+
+A Redis client module (or dummy implementation for testing)
+
+8. Installation & Deployment
+Instructions to install required Python packages.
+
+Setup and configuration details for the Redis client.
+
+Guidelines for integrating the component within the larger microservice architecture.
+
+9. API Reference
+GlobalTrackStatusManager:
+
+enqueue_event(event: dict)
+
+transition_to(new_state_class)
+
+schedule_timer(timeout: float, callback)
+
+cancel_timer()
+
+shutdown()
+
+GlobalTrackState and its subclasses:
+
+update(event: dict)
+
+on_enter()
+
+GlobalTrackRegistry:
+
+handle_event(event: dict)
+
+shutdown_all()
+
+10. Conclusion
+The ISee Global Status Manager provides a robust framework for managing global tracking statuses using a state machine, asynchronous event processing, and time-based transitions. Its modular design and clear separation of concerns make it easy to integrate, extend, and maintain within a microservice environment.
